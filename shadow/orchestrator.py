@@ -160,8 +160,18 @@ class Operator:
 
     def _fingerprint(self) -> dict:
         assert self.session is not None
+        pipes = ", ".join(self.profile.get("pipeline_substrings") or [])
+        tracks = ", ".join(self.profile.get("track_path_substrings") or [])
+        self._say(
+            f"fingerprint substrings pipeline=[{pipes}] track=[{tracks}] "
+            f"accept={self.profile.get('accept_score')}"
+        )
         raw = self.session.call_embedded(
             self.root, "shadow.collect", "build_snapshot", {"operator_unix": time.time()},
+        )
+        self._say(
+            f"collected hostname {raw.get('hostname_ignored') or 'unknown'} "
+            f"is not used in the score; ssh target {self.session.host}:{self.session.port}"
         )
         raw["role"] = "fingerprint"
         raw["taken_at"] = stamp()

@@ -1,6 +1,6 @@
 {
-  "pipeline_substrings": ["track", "sensor", "sentinel", "cuas", "radar", "fusion", "plot"],
-  "track_path_substrings": ["track", "cue", "sentinel", "cuas", "radar", "plot"],
+  "pipeline_substrings": ["trackd", "track"],
+  "track_path_substrings": ["/var/log/sentinel/tracks.log", "/run/sentinel/trackd.heartbeat", "tracks.log", "sentinel", "track"],
   "accept_score": 0.70,
   "ambiguous_score": 0.40
 }

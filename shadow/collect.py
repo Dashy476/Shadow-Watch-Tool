@@ -9,9 +9,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 from shadow.procparse import (
@@ -31,6 +33,49 @@ from shadow.procparse import (
     parse_systemctl_show,
     parse_unix,
 )
+
+_QUOTED_PATH = re.compile(r"""["'](/[^"'\\\s]{1,240})["']""")
+_PRIV_SCRIPT = r"""
+import json, os, sys
+out = {}
+for pid in sys.argv[1:]:
+    base = "/proc/" + pid
+    if not os.path.isdir(base):
+        continue
+    def link(name, root=base):
+        try:
+            return os.readlink(os.path.join(root, name))
+        except OSError:
+            return ""
+    fds = []
+    fd_dir = os.path.join(base, "fd")
+    try:
+        names = os.listdir(fd_dir)
+    except OSError:
+        names = []
+    for name in names:
+        try:
+            target = os.readlink(os.path.join(fd_dir, name))
+        except OSError:
+            continue
+        flags = ""
+        if target.startswith("socket:"):
+            try:
+                text = open(os.path.join(base, "fdinfo", name), encoding="utf-8", errors="replace").read()
+            except OSError:
+                text = ""
+            for line in text.splitlines():
+                if line.startswith("flags:"):
+                    flags = line.split(":", 1)[1].strip()
+                    break
+        fds.append({"fd": name, "target": target, "flags": flags})
+    try:
+        maps = open(os.path.join(base, "maps"), encoding="utf-8", errors="replace").read()
+    except OSError:
+        maps = ""
+    out[pid] = {"exe": link("exe"), "cwd": link("cwd"), "fds": fds, "maps": maps}
+json.dump(out, sys.stdout)
+"""
 
 KEY_NAME_HINTS = ("key.pem", "private.pem", "id_rsa", "id_ed25519", "id_ecdsa")
 FIXED_TRUST_PATHS = (
@@ -168,6 +213,17 @@ def _read_processes(sockets: list[dict], errors: list) -> tuple[list[dict], list
     for row in basics:
         parent = by_pid.get(row["ppid"])
         row["parent_comm"] = parent.get("comm") if parent else ""
+    denied = []
+    staged: dict[int, tuple[list[dict], list[dict]]] = {}
+    for row in basics:
+        if row["tool"]:
+            continue
+        fds, fd_denied = _read_fds(row["pid"])
+        proc_maps, map_denied = _read_maps(row["pid"])
+        staged[row["pid"]] = (fds, proc_maps)
+        if fd_denied or map_denied:
+            denied.append(row["pid"])
+    views = _privileged_views(denied, errors) if denied else {}
     maps = []
     for row in basics:
         if row["tool"]:
@@ -175,9 +231,18 @@ def _read_processes(sockets: list[dict], errors: list) -> tuple[list[dict], list
             row["file_heads"] = []
             row["environ"] = None
             continue
-        fds = _read_fds(row["pid"], errors)
+        fds, proc_maps = staged[row["pid"]]
+        view = views.get(row["pid"])
+        if view:
+            if view.get("exe"):
+                row["exe"] = view["exe"]
+            if view.get("cwd"):
+                row["cwd"] = view["cwd"]
+            fds = view.get("fds") or fds
+            proc_maps = view.get("maps") or proc_maps
+        elif row["pid"] in denied:
+            errors.append(f"/proc/{row['pid']}/fd: PermissionError")
         row["fds"] = fds
-        proc_maps = _read_maps(row["pid"], errors)
         for item in proc_maps:
             item["pid"] = row["pid"]
             maps.append(item)
@@ -224,6 +289,7 @@ def _one_process(entry: Path, errors: list) -> dict | None:
         "read_bytes": int(io.get("read_bytes") or 0),
         "tool": is_tool_cmdline(cmdline),
         "parent_comm": "",
+        "named_paths": _named_paths(cmdline),
     }
 
 
@@ -243,14 +309,15 @@ def _readlink(path: Path) -> str:
         return ""
 
 
-def _read_fds(pid: int, errors: list) -> list[dict]:
+def _read_fds(pid: int) -> tuple[list[dict], bool]:
     fd_dir = Path(f"/proc/{pid}/fd")
     found = []
     try:
         names = list(fd_dir.iterdir())
-    except OSError as exc:
-        errors.append(f"/proc/{pid}/fd: {exc.__class__.__name__}")
-        return []
+    except PermissionError:
+        return [], True
+    except OSError:
+        return [], False
     for fd in names:
         try:
             target = os.readlink(fd)
@@ -260,7 +327,7 @@ def _read_fds(pid: int, errors: list) -> list[dict]:
         if target.startswith("socket:"):
             mode = _fdinfo_mode(pid, fd.name)
         found.append({"fd": fd.name, "target": target, "mode": mode})
-    return found
+    return found, False
 
 
 def _fdinfo_mode(pid: int, fd_name: str) -> str:
@@ -275,18 +342,97 @@ def _fdinfo_mode(pid: int, fd_name: str) -> str:
     return ""
 
 
-def _read_maps(pid: int, errors: list) -> list[dict]:
+def _read_maps(pid: int) -> tuple[list[dict], bool]:
     path = Path(f"/proc/{pid}/maps")
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        errors.append(f"/proc/{pid}/maps: {exc.__class__.__name__}")
-        return []
+    except PermissionError:
+        return [], True
+    except OSError:
+        return [], False
+    return _interesting_maps(text), False
+
+
+def _interesting_maps(text: str) -> list[dict]:
     found = []
     for line in text.splitlines():
         parsed = parse_map_line(line)
         if parsed and interesting_path(parsed["path"]):
             found.append(parsed)
+    return found
+
+
+def _privileged_views(pids: list[int], errors: list) -> dict[int, dict]:
+    """Re-read /proc with sudo -n when the SSH user gets PermissionError.
+
+    trackd runs as root. Without this, its uplink socket is invisible and the
+    fingerprint cannot reach the accept threshold.
+    """
+    if not pids or shutil.which("sudo") is None:
+        return {}
+    try:
+        completed = subprocess.run(
+            ["sudo", "-n", sys.executable, "-c", _PRIV_SCRIPT, *[str(pid) for pid in pids]],
+            capture_output=True, text=True, timeout=8, check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        errors.append(f"sudo /proc: {exc.__class__.__name__}")
+        return {}
+    if completed.returncode != 0 or not (completed.stdout or "").strip():
+        return {}
+    try:
+        raw = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        errors.append("sudo /proc: bad json")
+        return {}
+    views = {}
+    for key, item in raw.items():
+        try:
+            pid = int(key)
+        except (TypeError, ValueError):
+            continue
+        fds = []
+        for fd in item.get("fds") or []:
+            target = fd.get("target") or ""
+            mode = fd_mode(fd.get("flags") or "") if target.startswith("socket:") else ""
+            fds.append({"fd": str(fd.get("fd") or ""), "target": target, "mode": mode})
+        views[pid] = {
+            "exe": item.get("exe") or "",
+            "cwd": item.get("cwd") or "",
+            "fds": fds,
+            "maps": _interesting_maps(item.get("maps") or ""),
+        }
+    return views
+
+
+def _named_paths(cmdline: str) -> list[str]:
+    """Absolute paths named by a readable program file on the command line.
+
+    trackd opens /var/log/sentinel/tracks.log only for each write, so the path
+    is not an fd at snapshot time. The script itself names that file.
+    """
+    found = []
+    seen = set()
+    for token in (cmdline or "").split():
+        if not token.startswith("/") or os.path.basename(token).startswith("python"):
+            continue
+        if not os.path.isfile(token):
+            continue
+        try:
+            if os.path.getsize(token) > 262144:
+                continue
+            text = Path(token).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in _QUOTED_PATH.finditer(text):
+            path = match.group(1)
+            if path in seen or not os.path.isfile(path):
+                continue
+            seen.add(path)
+            found.append(path)
+            if len(found) >= 20:
+                return found
     return found
 
 

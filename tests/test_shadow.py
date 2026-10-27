@@ -148,6 +148,34 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(rows[0]["state"], "ESTABLISHED")
         self.assertEqual(rows[0]["remote_port"], 443)
 
+    def test_ss_wildcard_listener(self):
+        text = (
+            "tcp LISTEN 0 128 *:22 *:*\n"
+            "tcp LISTEN 0 128 [::]:22 [::]:*\n"
+            "tcp LISTEN 0 128 :22 :*\n"
+        )
+        rows = parse_ss(text)
+        self.assertEqual(len(rows), 3)
+        by_local = {row["local"]: row for row in rows}
+
+        star = by_local["*:22"]
+        self.assertEqual(star["local_ip"], "*")
+        self.assertEqual(star["local_port"], 22)
+        self.assertEqual(star["remote_ip"], "*")
+        self.assertEqual(star["remote_port"], 0)
+
+        v6 = by_local[":::22"]
+        self.assertEqual(v6["local_ip"], "::")
+        self.assertEqual(v6["local_port"], 22)
+        self.assertEqual(v6["remote_ip"], "::")
+        self.assertEqual(v6["remote_port"], 0)
+
+        blank = by_local[":22"]
+        self.assertEqual(blank["local_ip"], "")
+        self.assertEqual(blank["local_port"], 22)
+        self.assertEqual(blank["remote_ip"], "")
+        self.assertEqual(blank["remote_port"], 0)
+
 
 class FingerprintTests(unittest.TestCase):
     def test_accepts_pipeline_and_ignores_hostname(self):

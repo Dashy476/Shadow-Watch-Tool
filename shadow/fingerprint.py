@@ -65,15 +65,26 @@ def _proc_has_data_path(proc: dict, snapshot: dict) -> bool:
 
 def _track_path_hit(snapshot: dict, profile: dict) -> str:
     needles = profile["track_path_substrings"]
+    fields = []
     for proc in _processes(snapshot):
-        fields = [proc.get("cwd") or "", proc.get("exe") or ""]
+        fields.append(proc.get("cwd") or "")
+        fields.append(proc.get("exe") or "")
         fields.extend(fd.get("target") or "" for fd in proc.get("fds") or [])
-        for field in fields:
-            if _text_hits(field, needles):
-                return field
+        fields.extend(proc.get("named_paths") or [])
     for row in snapshot.get("maps") or []:
-        if _text_hits(row.get("path") or "", needles):
-            return row.get("path") or ""
+        fields.append(row.get("path") or "")
+    return _best_field(fields, needles)
+
+
+def _best_field(fields: list[str], needles: list[str]) -> str:
+    """Prefer the longest substring so a full track path wins over 'track'."""
+    for needle in sorted((needles or []), key=len, reverse=True):
+        lowered = needle.lower()
+        if not lowered:
+            continue
+        for field in fields:
+            if lowered in (field or "").lower():
+                return field
     return ""
 
 

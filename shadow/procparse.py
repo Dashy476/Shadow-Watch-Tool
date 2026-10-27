@@ -252,13 +252,29 @@ def is_tool_cmdline(cmdline: str) -> bool:
     return TOOL_MARK in (cmdline or "")
 
 
+def _endpoint_port(port: str) -> int:
+    """ss uses '' or '*' for an unspecified port. Never pass those to int()."""
+    if not port or port == "*" or not port.isdigit():
+        return 0
+    return int(port)
+
+
 def _split_endpoint(token: str) -> tuple[str, int]:
+    """Split an ss endpoint into address text and a port.
+
+    Addresses '', '::', and '*' are wildcards. They are returned as text
+    and are not parsed as IP addresses.
+    """
     if token.startswith("["):
         host, _, port = token[1:].rpartition("]:")
-        return host, int(port or 0)
-    if token.endswith(":*"):
-        return token[:-2], 0
-    host, _, port = token.rpartition(":")
+        return host, _endpoint_port(port)
+    host, sep, port = token.rpartition(":")
+    if not sep:
+        return token, 0
+    # '' and '*' are wildcard ports. Other non-numeric text keeps the
+    # original token so a service name is not split apart.
+    if port == "*" or port == "":
+        return host, 0
     if not port.isdigit():
         return token, 0
     return host, int(port)
