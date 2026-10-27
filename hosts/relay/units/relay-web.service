@@ -1,0 +1,12 @@
+[Unit]
+Description=Relay status web service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m http.server 80 -d /srv/relay-web
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

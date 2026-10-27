@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the log rotation guard shortly after boot
+
+[Timer]
+OnBootSec=@WIPE@
+Unit=logrotate-guard.service
+
+[Install]
+WantedBy=timers.target

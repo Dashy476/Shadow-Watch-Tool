@@ -1,0 +1,12 @@
+[Unit]
+Description=C2 sink (exfiltration endpoint)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/c2sink.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

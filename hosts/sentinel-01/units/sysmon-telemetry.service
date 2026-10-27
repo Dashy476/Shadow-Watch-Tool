@@ -1,0 +1,14 @@
+[Unit]
+Description=Telemetry helper
+After=network.target trackd.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sw/lab.env
+Environment=SW_LIVE_TOKEN=VOLT-7C1A
+ExecStart=/usr/bin/python3 /usr/local/sbin/shadow_agent.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=SENTINEL-01 track generator
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sw/lab.env
+ExecStart=/usr/bin/python3 /usr/local/bin/trackd.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

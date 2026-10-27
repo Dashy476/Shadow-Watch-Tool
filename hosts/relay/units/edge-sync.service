@@ -1,0 +1,12 @@
+[Unit]
+Description=Edge sync helper
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/edge-sync.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

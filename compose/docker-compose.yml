@@ -1,0 +1,154 @@
+# Shadow Watch — Docker Compose multi-host lab
+#
+# Six hosts: relay (entry), console (hop 2), sentinel-01 (the sensor under
+# attack; must stay online), sentinel-02 (pivot target), mission-control
+# (availability), analyst (your live-response jump box).
+#
+# Two networks give the "trusted connections across the sensor cluster" its
+# topology: an edge network that reaches the relay/console, and a sensor network
+# that only the console and Mission Control cross into.
+#
+# Capabilities are granted deliberately (see README "Parity with a VM"):
+#   NET_ADMIN        -> iptables works inside the host
+#   NET_RAW          -> tcpdump / ping
+#   LINUX_IMMUTABLE  -> chattr +i works inside the host
+#   SYS_ADMIN        -> real systemd as PID 1
+#   SYS_PTRACE       -> read another process's /proc/<pid>/* (volatility drill)
+#   AUDIT_WRITE      -> journald
+# If systemd misbehaves on Docker Desktop, use docker-compose.privileged.yml.
+
+name: shadow-watch
+
+x-host: &host
+  restart: "no"
+  stop_signal: SIGRTMIN+3          # clean systemd shutdown
+  cgroup: host                     # systemd needs the host cgroup namespace on cgroup v2
+  security_opt:
+    - seccomp:unconfined
+  tmpfs:
+    - /run
+    - /run/lock
+    - /tmp
+  volumes:
+    - /sys/fs/cgroup:/sys/fs/cgroup:rw   # systemd needs writable cgroups (no privileged mode)
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+    - LINUX_IMMUTABLE
+    - SYS_ADMIN
+    - SYS_PTRACE
+    - AUDIT_WRITE
+  env_file:
+    - .env
+
+networks:
+  edge:
+    name: sw_edge
+    ipam:
+      config:
+        - subnet: 172.28.10.0/24
+  sensor:
+    name: sw_sensor
+    ipam:
+      config:
+        - subnet: 172.28.20.0/24
+
+services:
+  relay:
+    <<: *host
+    hostname: relay
+    container_name: sw-relay
+    build:
+      context: ..
+      dockerfile: hosts/relay/Dockerfile
+    networks:
+      edge:
+        ipv4_address: 172.28.10.10
+      sensor:
+        ipv4_address: 172.28.20.10   # the sensor cluster reaches the C2 outbound
+    ports:
+      - "2222:22"       # analyst SSH into the entry point
+      - "8088:80"       # the relay's exposed service (the initial-access surface)
+      - "4443:4443"     # the C2 sink (IOC advisory lists this)
+
+  console:
+    <<: *host
+    hostname: console
+    container_name: sw-console
+    build:
+      context: ..
+      dockerfile: hosts/console/Dockerfile
+    networks:
+      edge:
+        ipv4_address: 172.28.10.11
+      sensor:
+        ipv4_address: 172.28.20.11
+    ports:
+      - "2220:22"       # analyst SSH into the operator console
+
+  mission-control:
+    <<: *host
+    hostname: mission-control
+    container_name: sw-mission-control
+    build:
+      context: ..
+      dockerfile: hosts/mission-control/Dockerfile
+    networks:
+      edge:
+        ipv4_address: 172.28.10.12
+      sensor:
+        ipv4_address: 172.28.20.12
+    ports:
+      - "2223:22"
+      - "9000:9000"     # track ingest (the legitimate uplink target)
+      - "8000:8000"     # availability dashboard
+
+  sentinel-01:
+    <<: *host
+    hostname: sentinel-01
+    container_name: sw-sentinel-01
+    build:
+      context: ..
+      dockerfile: hosts/sentinel-01/Dockerfile
+      args:
+        # Exercise clock, in seconds. Set EXERCISE_WIPE_AFTER in compose/.env
+        # (or pass -Minutes / --minutes to the setup script). Baked into the
+        # timer unit at build time, so changing it requires a rebuild.
+        WIPE_AFTER: ${EXERCISE_WIPE_AFTER:-2700}
+    networks:
+      sensor:
+        ipv4_address: 172.28.20.21
+    ports:
+      - "2224:22"       # analyst SSH — this is the box you must NOT reboot
+
+  sentinel-02:
+    <<: *host
+    hostname: sentinel-02
+    container_name: sw-sentinel-02
+    build:
+      context: ..
+      dockerfile: hosts/sentinel-02/Dockerfile
+    networks:
+      sensor:
+        ipv4_address: 172.28.20.22
+    ports:
+      - "2225:22"
+
+  analyst:
+    <<: *host
+    hostname: analyst
+    container_name: sw-analyst
+    build:
+      context: ..
+      dockerfile: hosts/analyst/Dockerfile
+    networks:
+      edge:
+        ipv4_address: 172.28.10.13
+      sensor:
+        ipv4_address: 172.28.20.13
+    ports:
+      - "2226:22"       # your live-response jump box
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ../response:/home/analyst/response
+      - ../docs/ADVISORY-IOC-2026-114.md:/home/analyst/ADVISORY-IOC-2026-114.md:ro

@@ -1,0 +1,13 @@
+[Unit]
+Description=Mission Control track ingest and availability service
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sw/lab.env
+ExecStart=/usr/bin/python3 /usr/local/bin/mission_control.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

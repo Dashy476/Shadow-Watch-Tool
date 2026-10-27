@@ -1,0 +1,11 @@
+Operator console — service notes (internal)
+
+The sensor cluster trusts this console's key, so keep it locked down. Track
+uplink health on the console dashboard; if a sector goes quiet the operator
+should see it here first.
+
+Shared service password (relay + console, per ops handover):
+    CRED-5D03
+
+Reminder: this password is shared across the relay and the console. Rotate it
+once the maintenance window opens.

@@ -1,0 +1,6 @@
+{
+  "pipeline_substrings": ["track", "sensor", "sentinel", "cuas", "radar", "fusion", "plot"],
+  "track_path_substrings": ["track", "cue", "sentinel", "cuas", "radar", "plot"],
+  "accept_score": 0.70,
+  "ambiguous_score": 0.40
+}

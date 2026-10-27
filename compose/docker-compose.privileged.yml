@@ -1,0 +1,23 @@
+# Fallback override: run every host privileged.
+#
+# Apply ONLY if systemd misbehaves under the fine-grained capability grants in
+# docker-compose.yml (see README "Fallbacks"):
+#
+#   docker compose -f compose/docker-compose.yml -f compose/docker-compose.privileged.yml up -d
+#
+# The lab loses no capability that matters; it just stops relying on targeted
+# cap_add entries.
+
+services:
+  relay:
+    privileged: true
+  console:
+    privileged: true
+  mission-control:
+    privileged: true
+  sentinel-01:
+    privileged: true
+  sentinel-02:
+    privileged: true
+  analyst:
+    privileged: true

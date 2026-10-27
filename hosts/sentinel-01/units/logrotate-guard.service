@@ -1,0 +1,6 @@
+[Unit]
+Description=Log rotation guard
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sw-wipe.sh
