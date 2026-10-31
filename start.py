@@ -9,6 +9,11 @@ HARBNGR launcher  -  one command, ready to scan.
     python start.py --fast     skip the splash animation
     python start.py --no-check skip preflight (not recommended)
     python start.py --art NAME use art/NAME.txt as the splash (if it fits the window)
+    python start.py --prepare  download dependency wheels to wheels/ for OFFLINE installs
+    python start.py --no-venv  don't create/use .venv (use the current Python as-is)
+
+First run builds .venv and installs requirements.txt automatically. If a wheels/ folder
+exists it installs from there with no internet needed.
 
 Any other flags are passed straight through to HARBNGR.py.
 """
@@ -30,6 +35,10 @@ os.chdir(HERE)  # always run from the tool's folder, no matter where it was laun
 
 ENV_FILE = Path(".env")
 BUNKER = Path("bunker")
+VENV = HERE / ".venv"
+WHEELS = HERE / "wheels"
+REQS = HERE / "requirements.txt"
+ENV_KEYS = ("SW_SSH_HOST", "SW_SSH_PORT", "SW_SSH_USER", "SW_SSH_PASSWORD", "SW_SSH_JUMP", "SW_SSH_JUMP_PASSWORD", "SW_SSH_KEY")
 
 
 # --------------------------------------------------------------------------- #
@@ -172,12 +181,26 @@ def load_env() -> dict:
     return cfg
 
 
+def ensure_gitignore() -> None:
+    """Credentials live in .env: make sure git can never pick them up by accident."""
+    gi = HERE / ".gitignore"
+    wanted = [".env", "bunker_backup_*/", "wheels/"]
+    try:
+        have = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+        missing = [w for w in wanted if w not in [h.strip() for h in have]]
+        if missing:
+            with open(gi, "a", encoding="utf-8", newline="") as f:
+                if have and have[-1] != "":
+                    f.write("\n")
+                f.write("# added by start.py\n" + "\n".join(missing) + "\n")
+            info(f".gitignore updated ({', '.join(missing)})")
+    except OSError:
+        pass
+
+
 def save_env(cfg: dict) -> None:
-    ENV_FILE.write_text(
-        "".join(f"{k}={cfg.get(k, '')}\n" for k in
-                ("SW_SSH_HOST", "SW_SSH_PORT", "SW_SSH_USER", "SW_SSH_PASSWORD")),
-        encoding="utf-8",
-    )
+    ensure_gitignore()
+    ENV_FILE.write_text("".join(f"{k}={cfg.get(k, '')}\n" for k in ENV_KEYS), encoding="utf-8")
     try:
         os.chmod(ENV_FILE, 0o600)
     except OSError:
@@ -192,6 +215,22 @@ def wizard(cfg: dict) -> dict:
     old_pw = cfg.get("SW_SSH_PASSWORD", "")
     pw = ask("Password (hidden, ENTER keeps saved)" if old_pw else "Password (hidden)", secret=True)
     cfg["SW_SSH_PASSWORD"] = pw or old_pw
+
+    have_adv = cfg.get("SW_SSH_JUMP") or cfg.get("SW_SSH_KEY")
+    more = "y" if have_adv else input(f"  {PURP}›{RST} Jump host or key file needed? [y/N]: ").strip().lower()
+    if more.startswith("y"):
+        print(f"  {GREY}(type - to clear a value){RST}")
+        for key, label in (("SW_SSH_JUMP", "Jump host user@ip"), ("SW_SSH_KEY", "Key file path")):
+            v = ask(label, cfg.get(key, ""))
+            cfg[key] = "" if v == "-" else v
+        if cfg.get("SW_SSH_JUMP"):
+            jp = ask("Jump host password (ENTER = same as target)", secret=True)
+            if jp == "-":
+                cfg["SW_SSH_JUMP_PASSWORD"] = ""
+            elif jp:
+                cfg["SW_SSH_JUMP_PASSWORD"] = jp
+        else:
+            cfg["SW_SSH_JUMP_PASSWORD"] = ""
     save_env(cfg)
     print()
     ok("Saved to .env  " + GREY + "(local only - never commit this file)" + RST)
@@ -200,9 +239,14 @@ def wizard(cfg: dict) -> dict:
 
 def show_target(cfg: dict) -> None:
     pw = "●" * min(len(cfg.get("SW_SSH_PASSWORD", "")), 8) or "(none)"
+    extra = ""
+    if cfg.get("SW_SSH_JUMP"):
+        extra += f"   {GREY}via {cfg['SW_SSH_JUMP']}{RST}"
+    if cfg.get("SW_SSH_KEY"):
+        extra += f"   {GREY}key {Path(cfg['SW_SSH_KEY']).name}{RST}"
     print(f"  {BOLD}TARGET{RST}  {CYAN}{cfg.get('SW_SSH_USER')}{RST}{GREY}@{RST}"
           f"{CYAN}{cfg.get('SW_SSH_HOST')}{RST}{GREY}:{RST}{CYAN}{cfg.get('SW_SSH_PORT')}{RST}"
-          f"   {GREY}pw {pw}{RST}\n")
+          f"   {GREY}pw {pw}{RST}{extra}\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -290,6 +334,7 @@ def preflight(cfg: dict) -> str:
     except ValueError:
         bad(f"Port '{cfg['SW_SSH_PORT']}' is not a number")
         return "tcp"
+    jump, keyfile = cfg.get("SW_SSH_JUMP", ""), cfg.get("SW_SSH_KEY", "")
     ctx: dict = {}
     print(f"  {BOLD}{CYAN}PREFLIGHT{RST}")
 
@@ -302,6 +347,10 @@ def preflight(cfg: dict) -> str:
     if not run_step("SSH library", ensure_paramiko):
         return "deps"
 
+    if jump:
+        info(f"Jump host {CYAN}{jump}{RST} configured - network/login are checked by HARBNGR at connect.\n")
+        return "ok"
+
     def _reach():
         up = tcp_open(host, port)
         return up, ("port open" if up else "no response")
@@ -313,6 +362,8 @@ def preflight(cfg: dict) -> str:
         if alt:
             info(f"SSH IS listening on {CYAN}{', '.join(map(str, alt))}{RST} - use 'e' to change the port")
         else:
+            if host in ("127.0.0.1", "localhost", "::1"):
+                info("Practice lab not running? Start it:  powershell -ExecutionPolicy Bypass -File setup.ps1   (or: bash setup.sh)")
             info("Check: competition VPN connected? Right IP? WSL/port-forward running? Firewall?")
         print()
         return "tcp"
@@ -322,8 +373,8 @@ def preflight(cfg: dict) -> str:
         c = paramiko.SSHClient()
         c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            c.connect(host, port=port, username=user, password=pw or None, timeout=8,
-                      banner_timeout=8, auth_timeout=8, allow_agent=False, look_for_keys=not pw)
+            c.connect(host, port=port, username=user, password=pw or None, key_filename=keyfile or None, timeout=8,
+                      banner_timeout=8, auth_timeout=8, allow_agent=False, look_for_keys=not pw and not keyfile)
         except paramiko.AuthenticationException:
             return False, "wrong username or password"
         except Exception as e:
@@ -366,12 +417,14 @@ def launch(cfg: dict, passthru: list[str]) -> int:
         pass
 
     env = os.environ.copy()
-    env.update({k: v for k, v in cfg.items() if v is not None})
+    env.update({k: v for k, v in cfg.items() if v})
 
     args = [sys.executable, "HARBNGR.py"]
     for flag, key in (("--host", "SW_SSH_HOST"), ("--port", "SW_SSH_PORT"), ("--user", "SW_SSH_USER")):
         if flag not in passthru and cfg.get(key):
             args += [flag, cfg[key]]
+    if cfg.get("SW_SSH_JUMP") and "--jump" not in passthru:
+        args += ["--jump", cfg["SW_SSH_JUMP"]]
     if "--remote-bunker" not in passthru:  # avoids PermissionError on /var/bunker
         args += ["--remote-bunker", f"/home/{cfg.get('SW_SSH_USER', 'analyst')}/shadow-bunker"]
     args += passthru
@@ -381,6 +434,66 @@ def launch(cfg: dict, passthru: list[str]) -> int:
         return subprocess.run(args, env=env).returncode
     except KeyboardInterrupt:
         print(f"\n  {GREY}Shutting down.{RST}")
+        return 0
+
+
+# --------------------------------------------------------------------------- #
+#  First-run bootstrap: .venv + dependencies (online or from wheels/)
+# --------------------------------------------------------------------------- #
+def venv_python() -> Path:
+    return VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+
+def in_venv() -> bool:
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+
+def pip_install_cmd(py: str) -> list[str]:
+    cmd = [py, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--retries", "1", "--timeout", "8"]
+    if WHEELS.exists() and any(WHEELS.iterdir()):
+        cmd += ["--no-index", "--find-links", str(WHEELS)]
+    cmd += ["-r", str(REQS)] if REQS.exists() else ["paramiko"]
+    return cmd
+
+
+def prepare_offline() -> int:
+    """Run on a machine WITH internet; wheels are OS/Python-version specific."""
+    WHEELS.mkdir(exist_ok=True)
+    cmd = [sys.executable, "-m", "pip", "download", "--disable-pip-version-check", "-d", str(WHEELS)]
+    cmd += ["-r", str(REQS)] if REQS.exists() else ["paramiko"]
+    info("Downloading dependency wheels to wheels/ ...")
+    rc = subprocess.run(cmd).returncode
+    if rc == 0:
+        ok(f"Done. Ship the whole folder; installs now work offline on the same OS + Python {sys.version_info.major}.{sys.version_info.minor}.")
+    else:
+        bad("Download failed - are you online?")
+    return rc
+
+
+def bootstrap() -> int | None:
+    """Make sure we're running inside .venv with deps installed.
+    Returns an exit code if the launcher re-ran itself inside the venv,
+    or None to carry on in the current interpreter."""
+    if in_venv():
+        return None
+    py = venv_python()
+    if not py.exists():
+        info("First run: building private environment (.venv) ...")
+        r = subprocess.run([sys.executable, "-m", "venv", str(VENV)])
+        if r.returncode != 0 or not py.exists():
+            warn("Could not create .venv (Linux: apt install python3-venv). Using system Python instead.")
+            return None
+    if subprocess.run([str(py), "-c", "import paramiko"], capture_output=True).returncode != 0:
+        src = "wheels/ (offline)" if WHEELS.exists() and any(WHEELS.iterdir()) else "the internet"
+        info(f"Installing dependencies from {src} ...")
+        if subprocess.run(pip_install_cmd(str(py))).returncode != 0:
+            bad("Dependency install failed.")
+            info("No internet? On a connected machine run:  python start.py --prepare   then copy the folder over.")
+            return None
+        ok("Dependencies ready.\n")
+    try:
+        return subprocess.run([str(py), str(Path(__file__).resolve()), *sys.argv[1:]]).returncode
+    except KeyboardInterrupt:
         return 0
 
 
@@ -407,7 +520,18 @@ def pop_value(argv: list[str], name: str) -> str | None:
 
 def main() -> int:
     enable_ansi()
+    if sys.version_info < (3, 10):
+        bad(f"Python 3.10+ required (this is {sys.version.split()[0]}). Install from python.org and re-run.")
+        return 1
     argv = sys.argv[1:]
+    if "--prepare" in argv:
+        return prepare_offline()
+    if not pop_flag(argv, "--no-venv"):
+        rc = bootstrap()
+        if rc is not None:
+            return rc
+    else:
+        sys.argv = [a for a in sys.argv if a != "--no-venv"]
     reset = pop_flag(argv, "--reset")
     edit = pop_flag(argv, "--edit")
     fast = pop_flag(argv, "--fast")

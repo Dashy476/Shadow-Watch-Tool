@@ -1,0 +1,6 @@
+# keep shell scripts runnable on Linux/macOS/WSL no matter who committed them
+* text=auto
+*.sh  text eol=lf
+*.py  text eol=lf
+*.ps1 text eol=crlf
+*.bat text eol=crlf

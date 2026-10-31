@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# added by start.py
+.env
+bunker_backup_*/
+wheels/

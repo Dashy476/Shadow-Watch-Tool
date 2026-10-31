@@ -233,6 +233,7 @@ cat <<'NEXT'
       ssh -p 2225 analyst@localhost     # sentinel-02
       ssh -p 2223 analyst@localhost     # mission-control
 
+  Scan it with HARBNGR:  python3 start.py     (127.0.0.1:2224, analyst / analyst)
   Check your standing:   make status     (or python3 verifier/status.py)
   Grade your response:   make verify     (or python3 verifier/verify.py)
   Start over:            make reset
