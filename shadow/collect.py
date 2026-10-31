@@ -117,6 +117,7 @@ def build_snapshot(operator_unix: float = 0.0) -> dict:
     arp_rows = _read_text("/proc/net/arp", parse_arp, errors)
     processes, maps = _read_processes(sockets, errors)
     services = _read_services(processes, errors)
+    timers = _read_timers(errors)  # <-- NEW: Capture systemd timers
     perms = _read_perms(processes, errors)
     configs = _read_configs(processes, errors)
     skew = None
@@ -135,6 +136,7 @@ def build_snapshot(operator_unix: float = 0.0) -> dict:
         "processes": processes,
         "maps": maps,
         "services": services,
+        "timers": timers,  # <-- NEW: Expose to the JSON snapshot
         "perm_records": perms,
         "configs": configs,
         "errors": errors[:20],
@@ -739,3 +741,25 @@ def _yaml_scalar(value: str):
         return int(clean)
     except ValueError:
         return clean
+
+
+def _read_timers(errors: list) -> list[dict]:
+    """Capture all systemd timers to catch evasive persistence."""
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return []
+    try:
+        completed = subprocess.run(
+            [systemctl, "list-timers", "--all", "--no-pager", "--no-legend"],
+            capture_output=True, text=True, timeout=8, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        errors.append(f"systemctl timers: {exc.__class__.__name__}")
+        return []
+    
+    timers = []
+    for line in (completed.stdout or "").splitlines():
+        line = line.strip()
+        if line:
+            timers.append({"raw": line})
+    return timers

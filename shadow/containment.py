@@ -14,7 +14,10 @@ UNIT_RE = re.compile(r"^[A-Za-z0-9:@._\-]+$")
 PATH_RE = re.compile(r"^/[A-Za-z0-9._+\-/]+$")
 
 
-def suggest(classification: dict, services: list[dict], alerts: list[dict]) -> dict:
+def suggest(classification: dict, services: list[dict], alerts: list[dict], timers: list[dict] = None) -> dict:
+    if timers is None:
+        timers = []
+        
     protected = classification.get("protected")
     if classification.get("mission_unclear") or not protected:
         return {
@@ -25,6 +28,8 @@ def suggest(classification: dict, services: list[dict], alerts: list[dict]) -> d
     _bind_unit(protected, services)
     suggestions = []
     refused = []
+    
+    # 1. Network flow containment
     for flow in classification.get("flows") or []:
         if flow.get("action") != "block":
             continue
@@ -34,12 +39,23 @@ def suggest(classification: dict, services: list[dict], alerts: list[dict]) -> d
                 refused.append(f"{item['id']} refused: {reason}")
                 continue
             suggestions.append(item)
+            
+    # 2. File and trust containment
     for item in _for_trust(alerts, protected):
         reason = touches_protected(item, protected)
         if reason:
             refused.append(f"{item['id']} refused: {reason}")
             continue
         suggestions.append(item)
+        
+    # 3. Evasive systemd timer containment
+    for item in _for_timers(timers):
+        reason = touches_protected(item, protected)
+        if reason:
+            refused.append(f"{item['id']} refused: {reason}")
+            continue
+        suggestions.append(item)
+        
     suggestions.sort(key=lambda item: (item["risk"], -float(item.get("confidence") or 0)))
     for index, item in enumerate(suggestions, start=1):
         item["id"] = f"c{index}"
@@ -122,6 +138,41 @@ def _for_trust(alerts: list[dict], protected: dict) -> list[dict]:
     return items
 
 
+def _for_timers(timers: list[dict]) -> list[dict]:
+    items = []
+    # Hardcoded baseline of standard Ubuntu system timers
+    safe_timers = {
+        "apt-daily-upgrade.timer", "apt-daily.timer", "dpkg-db-backup.timer",
+        "e2scrub_all.timer", "fstrim.timer", "fwupd-refresh.timer",
+        "logrotate.timer", "man-db.timer", "motd-news.timer",
+        "systemd-tmpfiles-clean.timer", "update-notifier-download.timer",
+        "update-notifier-motd.timer", "phpsessionclean.timer",
+        "apport-autoreport.timer", "snapd.snap-repair.timer",
+        "ua-timer.timer", "snapd.aa-prompt-listener.timer"
+    }
+    
+    for t in timers:
+        line = t.get("raw", "")
+        parts = line.split()
+        timer_unit = ""
+        # Find the timer unit in the space-delimited string
+        for part in parts:
+            if part.endswith(".timer"):
+                timer_unit = part
+                break
+        
+        if not timer_unit or timer_unit in safe_timers:
+            continue
+            
+        items.append(_item(
+            "disable-timer", 1, 0.9, None, "", 0, timer_unit,
+            f"disable non-standard timer {timer_unit} driving evasive callbacks",
+            ["systemctl", "disable", "--now", timer_unit],
+            f"If this timer is legitimate, re-enable it with: systemctl enable --now {timer_unit}. Do not reboot."
+        ))
+    return items
+
+
 def _item(action, risk, confidence, pid, ip, port, unit, why, argv, rollback, extra=None) -> dict:
     item = {
         "id": action,
@@ -184,12 +235,18 @@ def validate_exec(argv: list[str]) -> str:
             return ""
         return "kill is only allowlisted as TERM for a single pid above 1"
     if head == "systemctl":
-        if len(argv) == 3 and argv[1] == "restart" and UNIT_RE.match(argv[2]):
-            lowered = argv[2].lower()
+        if len(argv) >= 3 and argv[1] in ("restart", "stop", "disable") and UNIT_RE.match(argv[-1]):
+            lowered = argv[-1].lower()
             if any(word in lowered for word in BANNED_UNIT_WORDS):
                 return "that unit is forbidden"
-            return ""
-        return "systemctl is only allowlisted as restart of one unit"
+            if argv[1] == "restart" and len(argv) == 3:
+                return ""
+            if argv[1] in ("stop", "disable"):
+                if len(argv) == 3:
+                    return ""
+                if len(argv) == 4 and argv[2] == "--now":
+                    return ""
+        return "systemctl is only allowlisted for restart/stop/disable on one unit, optionally with --now"
     if head == "chmod":
         if len(argv) == 3 and argv[1] == "600" and PATH_RE.match(argv[2]) and ".." not in argv[2]:
             return ""

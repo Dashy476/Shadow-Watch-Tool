@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import json
 import shutil
 import threading
 import time
 import uuid
+import paramiko
 from pathlib import Path
 
 from shadow.access import close_paths
@@ -22,17 +24,27 @@ from shadow.timeutil import stamp
 from shadow.timeline import availability, phase_event, render_writeup
 from shadow.topology import adjacency_list, write_outputs
 
+# ANSI Color Codes for terminal readability
+RED = "\033[91m"
+CYAN = "\033[96m"
+YELLOW = "\033[93m"
+MAGENTA = "\033[95m"
+RESET = "\033[0m"
+
 HELP = """
-status              timer, phase, availability
-alerts              highest impact first
-topo                adjacency list
-flows               phase 3, asks YES, classifies outbound flows
-contain             phase 4 suggestions, does not execute
+status (s)          timer, phase, availability
+alerts (a)          highest impact first
+topo (t)            adjacency list
+flows (f)           phase 3, classifies outbound flows
+contain (c)         phase 4 suggestions, does not execute
 do <id>             asks YES, then runs one allowlisted action
 phase <name>        log a competition-phase divider
-restore             copy modules to the bunker again
-writeup             phase 5 markdown
-quit                save and close
+restore (r)         copy modules to the bunker again
+writeup (w)         phase 5 markdown
+hunt <args> (h)     search snapshots (e.g., hunt --regex "flag{.*}" --scope environ)
+scan (x)            dashboard view of potential IOCs, processes, IPs, and timers
+mute (m)            toggle background logs on/off (still writes to events.log)
+quit (q)            save and close
 """.strip()
 
 
@@ -283,6 +295,7 @@ class Operator:
         first = self.watch.get("baseline") is None
         result = ingest(self.watch, snap, snap["taken_at"])
         topo = write_outputs(self.watch["graph"], self.local / "topology")
+        
         speeches = []
         with self._state_lock:
             self.state["topology_written"] = True
@@ -291,23 +304,27 @@ class Operator:
             if first and not self.state.get("baseline_ts"):
                 self.state["baseline_ts"] = snap["taken_at"]
                 self.state["baseline_unix"] = snap.get("operator_unix")
-                speeches.append(("baseline snapshot recorded; 45-minute evidence timer started", "snapshot", False))
+                speeches.append(("baseline snapshot recorded; 45-minute evidence timer started", "snapshot", False, True))
             alerts = self.state.setdefault("alerts", [])
             for item in result["alerts"]:
                 alerts.append(item)
-                speeches.append((item["summary"], "alert", True))
+                summary = item["summary"]
+                is_spam = "new tcp" in summary.lower() or "time_wait" in summary.lower()
+                speeches.append((summary, "alert", not is_spam, is_spam))
             del alerts[:-200]
             for line in result["edges"]:
-                speeches.append((line, "topology", False))
+                speeches.append((line, "topology", False, True))
+                
         note = "baseline" if first else "observation pass"
         self._evidence("snapshot", str(path), note)
         self.audit.append("snapshot", note, {"path": str(path)})
+        
         if not quiet:
-            for text, kind, is_alert in speeches:
+            for text, kind, is_alert, is_routine in speeches:
                 self._event(text, kind)
-                self._say(text, alert=is_alert)
+                self._say(text, alert=is_alert, routine=is_routine)
             if topo.get("dot"):
-                self._say(f"graphviz {topo['dot']}")
+                self._say(f"graphviz {topo['dot']}", routine=True)
         self._save_state()
 
     def _rebuild_watch(self) -> None:
@@ -325,10 +342,11 @@ class Operator:
             self.state["classify_note"] = result["note"]
 
     def _command_loop(self) -> None:
-        self._say("Phase 2 is running. Type help for commands.")
+        with self._print_lock:
+            print(f"\n{CYAN}{HELP}{RESET}\n", flush=True)
         while not self._stop.is_set():
             try:
-                line = input("shadow> ").strip()
+                line = input(f"{CYAN}shadow>{RESET} ").strip()
             except EOFError:
                 break
             if not line:
@@ -338,38 +356,354 @@ class Operator:
                 break
 
     def _dispatch(self, line: str) -> bool:
-        if line == "help":
-            self._say(HELP)
-        elif line == "status":
+        if line in ("help", "h", "?"):
+            with self._print_lock:
+                print(f"\n{CYAN}{HELP}{RESET}\n", flush=True)
+        elif line in ("status", "s"):
             self._status()
-        elif line == "alerts":
+        elif line in ("alerts", "a"):
             self._print_alerts()
-        elif line == "topo":
+        elif line in ("topo", "t"):
             self._say(adjacency_list(self.watch.get("graph") or {}))
-        elif line == "flows":
+        elif line in ("flows", "f"):
             self._flows()
-        elif line == "contain":
+        elif line in ("contain", "c"):
             self._contain()
         elif line.startswith("do "):
             self._do(line.split(None, 1)[1].strip())
         elif line.startswith("phase "):
             self._comp_phase(line.split(None, 1)[1].strip())
-        elif line == "restore":
+        elif line in ("restore", "r"):
             self._bootstrap()
-        elif line == "writeup":
+        elif line in ("writeup", "w"):
             self._writeup()
-        elif line == "quit":
+        elif line.startswith("hunt ") or line.startswith("hu "):
+            cmd_len = 5 if line.startswith("hunt ") else 3
+            self._hunt(line[cmd_len:].strip())
+        elif line in ("scan", "x"):
+            self._scan()
+        elif line in ("mute", "m"):
+            is_muted = self.state.get("muted", False)
+            self.state["muted"] = not is_muted
+            self._say(f"Quiet mode {'ON' if not is_muted else 'OFF'}. Routine network logs hidden.")
+            self.state["spam_count"] = 0 
+        elif line in ("quit", "q"):
             return False
         else:
-            self._say("unknown command. Type help.")
+            self._say("unknown command. Type help or ?")
         return True
+
+    def _scan(self) -> None:
+        latest = (self.watch.get("history") or [None])[-1]
+        if not latest:
+            self._say("No snapshots available to scan.")
+            return
+            
+        if self.watch.get("history"):
+            classification = run_classification(
+                self.watch["history"], self.state.get("pipeline"), self.iocs, self.profile,
+            )
+            self.state["classification"] = classification
+            self.state["flows_ran"] = True
+
+        # =========================================================================
+        # THE SESSION HIJACK BYPASS (Independent SSH Path Check)
+        # Separates root and home lookups to prevent wildcard/path dropouts.
+        # =========================================================================
+        import os, shlex, re
+        pwd = os.environ.get("SW_SSH_PASSWORD", "")
+        if not pwd:
+            for _attr in ("password", "passwd", "pwd", "_password"):
+                _v = getattr(self.session, _attr, None)
+                if isinstance(_v, str) and _v:
+                    pwd = _v
+                    break
+        if not pwd:
+            if getattr(self, "_cached_sudo_pwd", None) is None:
+                import getpass
+                try:
+                    self._cached_sudo_pwd = getpass.getpass("sudo password for remote host (needed to read /root/.ssh): ")
+                except Exception:
+                    self._cached_sudo_pwd = ""
+            pwd = self._cached_sudo_pwd
+        safe_pwd = shlex.quote(pwd)
+        
+        sudo_prefix = f"echo {safe_pwd} | sudo -S -p '' " if pwd else ""
+        
+        find_out = ""
+        keys_out = ""
+        hijack_err = ""
+        
+        try:
+            ssh_client = None
+            if hasattr(self.session, "exec_command") and callable(getattr(self.session, "exec_command")):
+                ssh_client = self.session
+            else:
+                for attr_name in dir(self.session):
+                    attr_val = getattr(self.session, attr_name)
+                    if hasattr(attr_val, "exec_command") and callable(getattr(attr_val, "exec_command")):
+                        ssh_client = attr_val
+                        break
+                        
+            if ssh_client:
+                # payload: find footholds + split + explicit root and home .ssh listing
+                cmd = f"{sudo_prefix}sh -c 'find /usr/local/sbin /opt /srv /tmp /dev/shm /etc/systemd/system -type f 2>/dev/null; echo \":::SPLIT:::\"; ls -la /root/.ssh 2>/dev/null; ls -la /home/*/.ssh 2>/dev/null'"
+                _, stdout, _ = ssh_client.exec_command(cmd)
+                raw_out = stdout.read().decode("utf-8", errors="ignore").strip()
+                
+                if ":::SPLIT:::" in raw_out:
+                    parts = raw_out.split(":::SPLIT:::")
+                    find_out = parts[0].strip()
+                    keys_out = parts[1].strip() if len(parts) > 1 else ""
+                else:
+                    find_out = raw_out 
+            else:
+                hijack_err = "Could not locate active SSH client in session object."
+                
+        except Exception as e:
+            hijack_err = f"Hijack execution failed: {e}"
+
+        # ---- Dedicated SSH key collection (separate exec so errors are visible) ----
+        key_entries = []   # list of (path, meta, [fingerprint lines])
+        key_err = ""
+        key_user = "?"
+        try:
+            if ssh_client:
+                key_script = (
+                    'for d in /root/.ssh /home/*/.ssh; do '
+                    '[ -d "$d" ] || continue; '
+                    'for f in "$d"/*; do '
+                    '[ -f "$f" ] || continue; '
+                    'echo ":::FILE:::$f|$(stat -c "%A %U %s bytes" "$f")"; '
+                    'case "$f" in *known_hosts*|*config) continue;; esac; '
+                    'ssh-keygen -lf "$f" </dev/null 2>&1; '
+                    'done; done'
+                )
+                key_script = 'echo ":::WHOAMI:::$(id -un)"; ' + key_script
+                key_cmd = f"{sudo_prefix}sh -c {shlex.quote(key_script)}"
+                _, k_out, k_err = ssh_client.exec_command(key_cmd, timeout=20)
+                k_text = k_out.read().decode("utf-8", errors="ignore")
+                k_etxt = k_err.read().decode("utf-8", errors="ignore").strip()
+                if "a password is required" in k_etxt or "incorrect password" in k_etxt:
+                    key_err = "sudo failed (is SW_SSH_PASSWORD set in the shell running the scanner?)"
+                elif k_etxt and not k_text.strip():
+                    key_err = k_etxt.splitlines()[-1][:120]
+                cur = None
+                for ln in k_text.splitlines():
+                    ln = ln.rstrip()
+                    if ln.startswith(":::WHOAMI:::"):
+                        key_user = ln[len(":::WHOAMI:::"):]
+                    elif ln.startswith(":::FILE:::"):
+                        path, _, meta = ln[len(":::FILE:::"):].partition("|")
+                        cur = (path, meta, [])
+                        key_entries.append(cur)
+                    elif ln and cur is not None:
+                        cur[2].append(ln)
+        except Exception as e:
+            key_err = f"key listing failed: {e}"
+
+        with self._print_lock:
+            print(f"\n{MAGENTA}=== HARBNGR IOC SCANNER ==={RESET}")
+
+            # 1. Open Listening Ports
+            print(f"\n{CYAN}[*] OPEN LISTENING PORTS:{RESET}")
+            listen = [s for s in latest.get("sockets", []) if s.get("state") == "LISTEN"]
+            if not listen:
+                print("  None detected.")
+            for s in listen[:15]:
+                print(f"  {YELLOW}{s.get('proto')}{RESET} {s.get('local')}")
+
+            # 2. Anomalous Processes
+            print(f"\n{CYAN}[*] POTENTIAL MALICIOUS PROCESSES (Live Memory Execution):{RESET}")
+            
+            sus_keywords = ["wipe", "shadow", "miner", "nc ", "ncat", "pwn", "c2", "beacon", "sw-respawn", "sw-wipe", "sw-", "guard"]
+            sus_paths = ["/tmp/", "/dev/shm/", "/var/tmp/", "/home/", "/opt/", "/srv/", "/usr/local/sbin/"]
+            
+            procs = []
+            for p in latest.get("processes", []):
+                cmd = p.get("cmdline", "").lower()
+                exe = p.get("exe", "").lower()
+                if "shadow-watch" in cmd or "harbngr" in cmd or "node_agent.py" in cmd:
+                    continue
+                if p.get("standout"):
+                    procs.append(p)
+                elif any(k in cmd for k in sus_keywords) or any(path in exe for path in sus_paths):
+                    procs.append(p)
+
+            unique_procs = {p["pid"]: p for p in procs}.values()
+            for p in list(unique_procs)[:15]:
+                print(f"  {RED}PID:{p.get('pid')}{RESET} | {YELLOW}{p.get('comm')}{RESET} | {p.get('cmdline')[:80]}")
+                
+            if not unique_procs:
+                print("  None detected.")
+
+            # 3. Active Directory Scrub
+            print(f"\n{CYAN}[*] ACTIVE ROOT DIRECTORY SCRUB (Hunting dormant payloads on disk):{RESET}")
+            if hijack_err:
+                print(f"  {YELLOW}SSH Hijack Error:{RESET} {hijack_err}")
+            elif find_out:
+                lines = find_out.strip().split("\n")
+                scrub_hits = 0
+                for line in lines:
+                    line = line.strip()
+                    if not line: continue
+                    # Route systemd files to Section 5
+                    if "/etc/systemd/system" in line: continue
+                    
+                    if any(k in line.lower() for k in sus_keywords):
+                        print(f"  {RED}[CRITICAL]{RESET} {line}")
+                        scrub_hits += 1
+                    elif line.startswith("/usr/local/sbin") or line.startswith("/srv") or line.startswith("/opt"):
+                        print(f"  {YELLOW}[SUSPICIOUS]{RESET} {line}")
+                        scrub_hits += 1
+                        
+                    if scrub_hits >= 20:
+                        print(f"  ... {YELLOW}and more (output truncated){RESET}")
+                        break
+                        
+                if not scrub_hits:
+                    print("  None detected in common footholds.")
+            else:
+                print(f"  {YELLOW}Hijacked query executed but returned empty.{RESET}")
+
+            # 4. Suspect C2 IPs
+            print(f"\n{CYAN}[*] POTENTIAL C2 IPs (Outbound Flow Anomalies):{RESET}")
+            classification = self.state.get("classification", {})
+            flows = classification.get("flows", [])
+            protected_ip = classification.get("protected", {}).get("remote_ip")
+            
+            c2_found = False
+            for f in flows:
+                ip = f.get("remote_ip")
+                if ip and ip != protected_ip:
+                    c2_found = True
+                    print(f"  {RED}{ip}:{f.get('remote_port')}{RESET} | {YELLOW}Theft Score:{RESET} {f.get('theft_score')} | {YELLOW}Engine Action:{RESET} {f.get('action')} {RED}[POTENTIAL BEACON]{RESET}")
+            
+            if not c2_found:
+                print("  None detected.")
+
+            # 5. Potential Evasive Timers & Services
+            print(f"\n{CYAN}[*] POTENTIAL EVASIVE PERSISTENCE (Root Systemd Timers & Services):{RESET}")
+            safe_timers = {
+                "apt-daily-upgrade.timer", "apt-daily.timer", "dpkg-db-backup.timer",
+                "e2scrub_all.timer", "fstrim.timer", "fwupd-refresh.timer",
+                "logrotate.timer", "man-db.timer", "motd-news.timer",
+                "systemd-tmpfiles-clean.timer", "update-notifier-download.timer",
+                "update-notifier-motd.timer", "phpsessionclean.timer",
+                "apport-autoreport.timer", "snapd.snap-repair.timer",
+                "ua-timer.timer", "snapd.aa-prompt-listener.timer"
+            }
+            persistence_found = 0
+            
+            # Parse raw files found in /etc/systemd/system
+            if find_out:
+                for line in find_out.strip().split("\n"):
+                    line = line.strip()
+                    if "/etc/systemd/system" in line:
+                        file_name = line.split("/")[-1]
+                        if file_name.endswith(".timer") and file_name not in safe_timers:
+                            print(f"  {RED}Anomalous Timer File:{RESET} {line}")
+                            persistence_found += 1
+                        elif file_name.endswith(".service") and any(k in file_name for k in sus_keywords):
+                            print(f"  {RED}Anomalous Service File:{RESET} {line}")
+                            persistence_found += 1
+                        
+            # Standard Service Parsing from Agent Snapshot
+            for s in latest.get("services") or []:
+                s_str = json.dumps(s).lower() if isinstance(s, dict) else str(s).lower()
+                if any(k in s_str for k in sus_keywords):
+                    if isinstance(s, dict):
+                        unit = s.get("unit", "Unknown")
+                        exec_cmd = s.get("exec", "")
+                        print(f"  {RED}Malicious Service:{RESET} {unit} | {YELLOW}Exec:{RESET} {exec_cmd[:60]}")
+                    else:
+                        print(f"  {RED}Malicious Service:{RESET} {s_str[:100]}")
+                    persistence_found += 1
+
+            if not persistence_found:
+                print("  None detected.")
+
+            # 6. Rogue SSH Keys
+            print(f"\n{CYAN}[*] SSH DIRECTORY CONTENTS (Manually audit for backdoors):{RESET}")
+            if key_err:
+                print(f"  {YELLOW}Key listing error:{RESET} {key_err}")
+            elif key_user != "root":
+                print(f"  {YELLOW}Scan ran as '{key_user}', not root - cannot read /root/.ssh. "
+                      f"Sudo password missing or wrong.{RESET}")
+            elif not key_entries:
+                print("  Ran as root; no key files found.")
+            for path, meta, fps in key_entries:
+                name = path.rsplit("/", 1)[-1].lower()
+                hot = any(k in name for k in ("sensor_trust", "shadow", "authorized_keys", "id_"))
+                tag = f"{RED}[CRITICAL]{RESET}" if hot else f"{YELLOW}[KEY FILE]{RESET}"
+                print(f"  {tag} {path}  ({meta})")
+                for fp in fps:
+                    if "not a public key file" in fp or "invalid format" in fp or "No such file" in fp:
+                        print(f"      {YELLOW}-> not a parseable key (config/other){RESET}")
+                    else:
+                        print(f"      {CYAN}->{RESET} {fp}")
+
+            print(f"{MAGENTA}==========================={RESET}\n", flush=True)
+
+    def _hunt(self, args_str: str) -> None:
+        import argparse, shlex, re
+        parser = argparse.ArgumentParser(prog="hunt", add_help=False)
+        parser.add_argument("term", nargs="?", default="")
+        parser.add_argument("--regex", action="store_true")
+        parser.add_argument("--scope", default="", help="Filter by JSON key (e.g., 'environ' or 'maps')")
+        
+        try:
+            args = parser.parse_args(shlex.split(args_str))
+        except SystemExit:
+            self._say("usage: hunt <term> [--regex] [--scope str]")
+            return
+
+        if not args.term:
+            self._say("hunt requires a search term")
+            return
+
+        pattern = re.compile(args.term) if args.regex else None
+        snaps = _load_observe_snapshots(self.local / "snapshots", self.state.get("session_id"))
+        
+        if not snaps:
+            self._say("No snapshots available to hunt through.")
+            return
+
+        self._say(f"Hunting for '{args.term}' across {len(snaps)} snapshots...")
+        
+        matches = []
+        for snap in snaps:
+            ts = snap.get("taken_at")
+            
+            def _search(obj, current_scope=""):
+                if isinstance(obj, dict):
+                    if args.scope and current_scope != args.scope and args.scope in obj:
+                        _search(obj[args.scope], args.scope)
+                    else:
+                        for k, v in obj.items():
+                            _search(v, k)
+                elif isinstance(obj, list):
+                    for item in obj:
+                        _search(item, current_scope)
+                elif isinstance(obj, str):
+                    if (pattern and pattern.search(obj)) or (not pattern and args.term in obj):
+                        matches.append(f"[{ts}] Match in <{current_scope}>: {obj[:200]}")
+
+            _search(snap)
+
+        unique_matches = list(dict.fromkeys(matches))
+        if not unique_matches:
+            self._say("No matches found.")
+        else:
+            for match in unique_matches:
+                self._say(match)         
 
     def _flows(self) -> None:
         if not self._check_integrity():
             return
-        if input("Type YES to classify outbound flows: ").strip() != "YES":
-            self._say("classification cancelled")
-            return
+            
+        self._say("Classifying outbound flows...")
+        
         result = run_classification(
             self.watch.get("history") or [], self.state.get("pipeline"), self.iocs, self.profile,
         )
@@ -411,6 +745,7 @@ class Operator:
             self.state.get("classification") or {},
             latest.get("services") or [],
             self.state.get("alerts") or [],
+            latest.get("timers") or []
         )
         self.state["suggestions"] = report["suggestions"]
         if report.get("note"):
@@ -565,7 +900,7 @@ class Operator:
             "flows_ran": self.state.get("flows_ran"),
             "mission_unclear": self.state.get("mission_unclear"),
             "classify_note": self.state.get("classify_note") or "",
-            "protected_touched": self.state.get("protected_touched", False),
+            "protected_touched": self.state.get("operator_snapshots") or 0,
             "operator_snapshots": self.state.get("operator_snapshots") or 0,
             "timeline": self.state.get("timeline") or [],
             "access_paths": self.state.get("access_paths") or [],
@@ -585,14 +920,30 @@ class Operator:
         if usage.free < 20 * 1024 * 1024:
             self._say(f"operator bunker low on space: {usage.free} bytes free")
 
-    def _say(self, text: str, alert: bool = False) -> None:
+    def _say(self, text: str, alert: bool = False, routine: bool = False) -> None:
         label, prefix, expired = remaining(self.state.get("baseline_unix"), time.time())
+        
         if alert:
             line = format_alert(stamp(), text, label, prefix, expired)
+            line = f"{RED}{line}{RESET}"
         else:
             line = f"[{stamp()}] timer={label} {text}"
+            
+        with open(self.local / "events.log", "a", encoding="utf-8") as log_file:
+            log_file.write(line + "\n")
+            
+        # Hard mute: Drop everything flagged as routine (including spammy alert logs)
+        if self.state.get("muted", False) and routine:
+            return
+
         with self._print_lock:
             print("\n" + line, flush=True)
+            
+            # Smart spam reminder system
+            if not self.state.get("muted", False) and routine:
+                self.state["spam_count"] = self.state.get("spam_count", 0) + 1
+                if self.state["spam_count"] == 10:
+                    print(f"\n{YELLOW}[!] Pro-Tip: Type 'm' or 'mute' and press Enter to hide this routine network spam.{RESET}", flush=True)
 
     def _event(self, text: str, kind: str) -> None:
         with self._state_lock:
@@ -752,7 +1103,12 @@ def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    temporary.replace(path)
+    try:
+        temporary.replace(path)
+    except PermissionError:
+        import time
+        time.sleep(0.1)
+        temporary.replace(path)
 
 
 def _file_stamp() -> str:
