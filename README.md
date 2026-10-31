@@ -6,7 +6,45 @@ HARBNGR runs on the operator machine and is the only place Paramiko is used. Cod
 
 The SSH connect, retry, and host-key handling are the kept part of HARBNGR from `recon-cve-cli`. Attack-chain generation, Exploit-DB, Vulners, Ollama, multi-host scans, and MITRE attack mapping are not in this tree. The detection math is adapted from Guilded Guardian `gg_t2`, `gg_t3`, `gg_t10`, and `gg_t17`, and it only reads.
 
+## Quick start
+
+1. Install **Python 3.10 or newer** (Windows: tick "Add Python to PATH").
+2. From this folder run:
+
+```powershell
+python start.py          # Linux / macOS / WSL: python3 start.py
+```
+
+That is the whole install. On first run the launcher builds a private `.venv`, installs `requirements.txt`, asks for the target (IP, port, username, password, and a jump host or key file if you need one), runs a **preflight**, and launches HARBNGR with the right flags. Next runs: press ENTER to launch, or use `python start.py -y` for zero prompts.
+
+Preflight checks, in order: scanner files present, SSH library installed, target port reachable, SSH login works, and `sudo` gives root (needed for `/root`). Problems are reported before the scan starts, with a retry/edit menu. If the port is dead it also lists the ports where SSH is actually listening.
+
+| Flag | What it does |
+| --- | --- |
+| `-y`, `--yes` | No prompts: saved target, preflight, launch. Resumes any existing session. |
+| `--edit` | Change target or credentials. |
+| `--reset` | Forget the saved target and re-run setup. |
+| `--fast` | Skip the splash animation. |
+| `--art NAME` | Use `art/NAME.txt` as the splash if it fits the window. |
+| `--no-check` | Skip preflight (not recommended). |
+| `--prepare` | Download dependency wheels to `wheels/` for offline installs. |
+| `--no-venv` | Use the current Python instead of `.venv`. |
+
+Any other flag is passed to `HARBNGR.py` (`--interval`, `--profile`, `--iocs`, `--replay`, ...).
+
+**No internet on the competition network?** On a connected machine of the same OS and Python version, run `python start.py --prepare` once. It downloads the dependency wheels into `wheels/`. Copy the whole folder over and the launcher installs from there, offline.
+
+**Old session found?** You choose Resume or New. New copies `bunker/` to `bunker_backup_<timestamp>/` before wiping, so evidence is never lost to a stray keypress.
+
+The launcher saves the target in `.env` (never commit it; the launcher adds it to `.gitignore` if missing). Delete `.env` when the event is over.
+
+### Practice lab
+
+`setup.ps1` / `setup.sh` bring up the six-host Docker lab (see `START-HERE.md`). Once it is running, the defaults in `start.py` already point at SENTINEL-01: `analyst@127.0.0.1:2224`, password `analyst`. The lab scripts install Docker and the cluster; `start.py` installs and launches the scanner. They are independent.
+
 ## Install
+
+`python start.py` does all of this for you. Manual steps, if you prefer:
 
 ```powershell
 cd <path-to-shadow-watch>
@@ -33,6 +71,8 @@ $env:SW_SSH_JUMP = "jumpuser@10.0.0.2"
 ```
 
 A missing password is prompted with `getpass` and is not written to the audit log.
+
+Jump-box extras, if needed: `SW_SSH_JUMP_PASSWORD` (defaults to the target password), `SW_SSH_JUMP_PORT`, `SW_SSH_JUMP_USER`. The launcher asks for a jump host, key file and jump password during setup and sets these for you.
 
 If access is a Sliver pivot, forward a local port and point HARBNGR at it. For an SSH jump, set `SW_SSH_JUMP`. This tool does not speak Sliver. Every connection, including a pivot, is fingerprinted. A weak score stops the run.
 
@@ -65,6 +105,25 @@ A background loop pulls a snapshot every 2–5 seconds over the same SSH session
 Alerts print only when something changed: new PID, new socket, new map, or a service that is new, missing, or moved relative to the baseline. The node-agent process itself is ignored so the loop does not alert on itself.
 
 Topology updates on the same loop and writes `bunker/topology/adjacency.txt`. A Graphviz `.dot` file is written only when the `dot` binary is on the operator PATH. Edges keep their first-seen time.
+
+### One-shot IOC sweep: `x`
+
+```text
+shadow> x
+```
+
+Prints a colour-coded dashboard in one pass. It runs read-only commands over the open SSH session with `sudo`, so it can see root-owned paths that the node agent's allowlist does not cover. It never writes to the node.
+
+| Section | What it checks |
+| --- | --- |
+| Open listening ports | Listening sockets from the latest snapshot |
+| Potential malicious processes | Standout processes, suspicious keywords (`wipe`, `shadow`, `sw-`, `guard`, ...), and executables under `/tmp`, `/dev/shm`, `/opt`, `/srv`, `/usr/local/sbin`, `/home` |
+| Active root directory scrub | Files under `/usr/local/sbin`, `/opt`, `/srv`, `/tmp`, `/dev/shm`, `/etc/systemd/system`; flags dormant payloads such as `sw-wipe.sh`, `sw-respawn.sh`, `shadow_agent.py`, `parity.sh` |
+| Potential C2 IPs | Outbound flows classified by the differentiator, with theft score and engine action |
+| Evasive persistence | systemd timers and services compared with an Ubuntu baseline (catches look-alikes such as `logrotate-guard.*`) |
+| SSH directory contents | Every file in `/root/.ssh` and `/home/*/.ssh` with permissions, owner, size, and `ssh-keygen -lf` fingerprint |
+
+Needs root. If `sudo` did not work, the SSH section says "Scan ran as '<user>', not root". The sudo password is the same one used to log in; with key login you are asked for it once. A file in `.ssh` that is private-key sized and not named `id_*`, or an `authorized_keys` entry you do not recognise, is worth investigating: compare fingerprints against keys you own.
 
 ### Phase 3 — flows
 
@@ -117,7 +176,7 @@ Writes `bunker/writeup.md` and prints it. Fill in **What you'd do differently** 
 7. Evidence collected inside the 45-minute window
 8. Writeup sections present
 
-Other commands: `status`, `alerts`, `topo`, `phase <name>`, `restore`, `help`, `quit`.
+Other commands: `x`, `status`, `alerts`, `topo`, `phase <name>`, `restore`, `help`, `quit`.
 
 `phase <name>` logs a divider when the competition drops a new phase. Later timeline lines nest under it.
 
@@ -129,7 +188,7 @@ The main line shows the evidence timer as `mm:ss` once the baseline exists. At 1
 
 Soft nudges, once per phase: landing/snapshot/topology 15 min, observation/differentiation 60 min, containment 45 min, writeup 30 min.
 
-On startup the tool hashes its own modules. If they differ from `bunker/module_manifest.json`, type `INTEGRITY ACK` to continue. The same check runs before `flows`, `contain`, `do`, and on the remote bunker copy.
+On startup the tool hashes its own modules. If they differ from `bunker/module_manifest.json`, type `INTEGRITY ACK` to continue. `start.py` deletes that manifest before each launch so edited modules do not trigger the lock; launch `HARBNGR.py` directly if you want the check enforced. The same check runs before `flows`, `contain`, `do`, and on the remote bunker copy.
 
 `bunker/audit.jsonl` is a hash-chained log of commands, snapshots, and decisions. It is local only.
 
@@ -143,6 +202,18 @@ python HARBNGR.py --replay <path-to-snaps> --local-bunker <output-dir>
 
 Reads snapshot JSON, runs the same scoring, and writes suggestions plus a writeup. It does not connect and it does not run containment.
 
+## Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| Preflight: "no response" | VPN up? Right IP and port? Practice lab running (`setup.ps1` / `bash setup.sh`)? The launcher lists ports where SSH is listening; press `e` to change the port. |
+| Preflight: "wrong username or password" | Press `e` and re-enter. The same password is used for `sudo`. |
+| Preflight: "sudo failed" | Account is not a sudoer, or the password is wrong. The scan runs but is blind to `/root`. |
+| "paramiko missing" | Let the launcher install it, or run `python start.py --prepare` on a connected machine for offline use. |
+| Linux: `.venv` could not be created | `sudo apt install python3-venv`, or use `--no-venv`. |
+| `setup.sh: $'\r': command not found` | The script has Windows line endings. Run `sed -i 's/\r$//' setup.sh`, or see `.gitattributes`. |
+| Splash art garbled | Use Windows Terminal; classic `cmd.exe` fonts lack the braille glyphs. |
+
 ## Tests
 
 ```powershell
@@ -155,7 +226,9 @@ No SSH and no Paramiko required for the tests.
 
 | Path | Role |
 | --- | --- |
+| `start.py` | Launcher: bootstrap, setup, preflight, launch |
 | `HARBNGR.py` | Operator entry |
+| `setup.ps1`, `setup.sh`, `lab.ps1` | Practice-lab (Docker) setup and control |
 | `shadow/session.py` | Paramiko session, retry, SFTP, TCP probe |
 | `shadow/node_agent.py` | On-node entry: `snapshot`, `space`, `hashes`, `run` |
 | `shadow/collect.py` | `/proc` snapshot |
@@ -167,6 +240,8 @@ No SSH and no Paramiko required for the tests.
 | `shadow/containment.py` | Suggestions and the exec allowlist |
 | `shadow/timeline.py` | Gates and writeup |
 | `profiles/sentinel01.json` | Fingerprint substrings and thresholds |
+| `art/` | Optional splash art (`art/NAME.txt`) |
+| `wheels/` | Optional offline dependency cache (`--prepare`) |
 
 ## Never
 
@@ -174,3 +249,4 @@ No SSH and no Paramiko required for the tests.
 - Write to a live socket, including the mission uplink.
 - Run containment without `YES`.
 - Treat the hostname string as proof of the target node.
+- Commit `.env`, `bunker/`, or any saved credentials.
