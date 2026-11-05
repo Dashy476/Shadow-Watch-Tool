@@ -1,0 +1,24 @@
+{
+  "role": "SENTINEL-01",
+  "host": "10.80.40.11",
+  "label": "sentinel",
+  "accept_score": 0.70,
+  "ambiguous_score": 0.40,
+  "hostname_ignored": true,
+  "parent_not_shell": true,
+  "listen_ports": [8080],
+  "pipeline_substrings": ["cuas", "console", "diagnostics", "sentinel", "gunicorn", "uvicorn", "nginx", "track"],
+  "track_path_substrings": ["/var/lib/sentinel", "/var/log/sentinel", "tracks", "diagnostics", "cuas", "export"],
+  "benign_peers": {
+    "10.80.40.12": "EDGE-02 detection flow",
+    "10.80.40.13": "OPS-03 log-forwarding baseline"
+  },
+  "look_for": [
+    "Hostname is ignored. Accept threshold is 0.70. Parent of the pipeline process must not be a shell.",
+    "The pipeline process should hold a non-quiet listen socket or an established non-local socket.",
+    "On first connect, replace these placeholder substrings with the real process and path names.",
+    "Look for the cUAS web server or sensor daemon. The operator console listens on port 8080.",
+    "Look for the diagnostics export used by authenticated users.",
+    "Expected peers from this host: 10.80.40.12 (detections) and 10.80.40.13 (log forwarding). The SENSOR is out of scope."
+  ]
+}

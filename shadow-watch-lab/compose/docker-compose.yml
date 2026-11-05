@@ -1,0 +1,87 @@
+# Operation Phantom Grid practice lab, team Bits_N_Bytes (team 40).
+#
+# Three hosts on 10.80.40.0/24, matching the participant guide:
+#   SENTINEL-01  10.80.40.11  cUAS console :8080, detections in, logs out
+#   EDGE-02      10.80.40.12  telemetry converted to detections for SENTINEL-01
+#   OPS-03       10.80.40.13  retains logs forwarded from SENTINEL-01
+#
+# The SENSOR that feeds EDGE-02 is out of scope and is not a container.
+# Windows cannot publish the three container addresses as host addresses, so
+# SSH (port 22 inside each host) is published on localhost:
+#   127.0.0.1:2211 SENTINEL-01, also 127.0.0.1:8080 for the console
+#   127.0.0.1:2212 EDGE-02
+#   127.0.0.1:2213 OPS-03
+#
+# Capabilities match a VM closely enough for systemctl, iptables, and chattr.
+# If systemd misbehaves, add compose/docker-compose.privileged.yml.
+
+name: shadow-watch
+
+x-host: &host
+  restart: "no"
+  stop_signal: SIGRTMIN+3
+  cgroup: host
+  security_opt:
+    - seccomp:unconfined
+  tmpfs:
+    - /run
+    - /run/lock
+    - /tmp
+  volumes:
+    - /sys/fs/cgroup:/sys/fs/cgroup:rw
+  cap_add:
+    - NET_ADMIN
+    - NET_RAW
+    - LINUX_IMMUTABLE
+    - SYS_ADMIN
+    - SYS_PTRACE
+    - AUDIT_WRITE
+
+networks:
+  team:
+    name: sw_team40
+    ipam:
+      config:
+        - subnet: 10.80.40.0/24
+          gateway: 10.80.40.1
+
+services:
+  sentinel-01:
+    <<: *host
+    hostname: SENTINEL-01
+    container_name: sw-sentinel-01
+    build:
+      context: ..
+      dockerfile: hosts/sentinel-01/Dockerfile
+    networks:
+      team:
+        ipv4_address: 10.80.40.11
+    ports:
+      - "127.0.0.1:2211:22"
+      - "127.0.0.1:8080:8080"
+
+  edge-02:
+    <<: *host
+    hostname: EDGE-02
+    container_name: sw-edge-02
+    build:
+      context: ..
+      dockerfile: hosts/edge-02/Dockerfile
+    networks:
+      team:
+        ipv4_address: 10.80.40.12
+    ports:
+      - "127.0.0.1:2212:22"
+
+  ops-03:
+    <<: *host
+    hostname: OPS-03
+    container_name: sw-ops-03
+    build:
+      context: ..
+      dockerfile: hosts/ops-03/Dockerfile
+    networks:
+      team:
+        ipv4_address: 10.80.40.13
+    ports:
+      - "127.0.0.1:2213:22"

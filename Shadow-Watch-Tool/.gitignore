@@ -1,0 +1,16 @@
+bunker/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# added by start.py
+.env
+.env.*
+hosts.env
+bunker-sentinel/
+bunker-edge/
+bunker-ops/
+merged-report.md
+bunker_backup_*/
+wheels/

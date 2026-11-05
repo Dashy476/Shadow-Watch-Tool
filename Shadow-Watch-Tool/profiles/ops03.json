@@ -1,0 +1,22 @@
+{
+  "role": "OPS-03",
+  "host": "10.80.40.13",
+  "label": "ops",
+  "accept_score": 0.70,
+  "ambiguous_score": 0.40,
+  "hostname_ignored": true,
+  "parent_not_shell": true,
+  "listen_ports": [],
+  "pipeline_substrings": ["rsyslog", "syslog", "journal", "forward", "vector", "fluent", "filebeat"],
+  "track_path_substrings": ["/var/log", "forwarded", "/var/log/sentinel", "syslog"],
+  "benign_peers": {
+    "10.80.40.11": "logs retained from SENTINEL-01"
+  },
+  "look_for": [
+    "Hostname is ignored. Accept threshold is 0.70. Parent of the pipeline process must not be a shell.",
+    "The pipeline process should hold a non-quiet listen socket or an established non-local socket.",
+    "On first connect, replace these placeholder substrings with the real log-forwarder or rsyslog-style process name.",
+    "This host retains logs forwarded from SENTINEL-01 (10.80.40.11).",
+    "A theft flow may mimic this log-forwarding flow. Destination is the axis that separates them."
+  ]
+}

@@ -1,0 +1,11 @@
+# Fallback: privileged containers if systemd misbehaves under cap_add.
+#
+#   docker compose -f compose/docker-compose.yml -f compose/docker-compose.privileged.yml up -d
+
+services:
+  sentinel-01:
+    privileged: true
+  edge-02:
+    privileged: true
+  ops-03:
+    privileged: true

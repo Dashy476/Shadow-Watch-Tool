@@ -1,0 +1,7 @@
+# Practice targets for this Docker lab.
+# Inside the containers SSH is port 22 on 10.80.40.11-13.
+# These published ports are how this Windows host reaches them.
+# One host per line: IP port user label
+127.0.0.1 2211 operator sentinel
+127.0.0.1 2212 operator edge
+127.0.0.1 2213 operator ops

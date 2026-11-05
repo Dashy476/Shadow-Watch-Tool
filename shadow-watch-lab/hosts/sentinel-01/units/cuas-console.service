@@ -1,0 +1,14 @@
+[Unit]
+Description=SENTINEL-01 cUAS console
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sw/lab.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /usr/local/bin/cuas-console.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

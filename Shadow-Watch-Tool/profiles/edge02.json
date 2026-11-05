@@ -1,0 +1,22 @@
+{
+  "role": "EDGE-02",
+  "host": "10.80.40.12",
+  "label": "edge",
+  "accept_score": 0.70,
+  "ambiguous_score": 0.40,
+  "hostname_ignored": true,
+  "parent_not_shell": true,
+  "listen_ports": [],
+  "pipeline_substrings": ["telemetry", "detect", "edge", "ingest", "radar", "plot"],
+  "track_path_substrings": ["/var/lib/edge", "/var/log/edge", "telemetry", "detections", "detect"],
+  "benign_peers": {
+    "10.80.40.11": "detections delivered to SENTINEL-01"
+  },
+  "look_for": [
+    "Hostname is ignored. Accept threshold is 0.70. Parent of the pipeline process must not be a shell.",
+    "The pipeline process should hold a non-quiet listen socket or an established non-local socket.",
+    "On first connect, replace these placeholder substrings with the real telemetry-receiver process name.",
+    "This host converts aircraft telemetry into detections for SENTINEL-01 (10.80.40.11).",
+    "The SENSOR that feeds this host is out of scope. Do not add it to the profile or the host list."
+  ]
+}

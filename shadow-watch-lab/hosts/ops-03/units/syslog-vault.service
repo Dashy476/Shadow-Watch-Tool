@@ -1,0 +1,14 @@
+[Unit]
+Description=OPS-03 syslog vault for SENTINEL-01 logs
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/sw/lab.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /usr/local/bin/syslog-vault.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
